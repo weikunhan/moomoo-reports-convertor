@@ -1,9 +1,9 @@
 import os
 import re
 from typing import Any, Optional, Tuple
+
 import numpy as np
 import pandas as pd
-
 
 try:
     from google.colab import drive
@@ -12,6 +12,9 @@ try:
 except ImportError:
     pass
 
+TARGET_SYMBOL = "CVNA"
+INPUT_FILENAME = "raw_data.csv"
+WORK_DIR = "/content/drive/MyDrive/Test"
 INPUT_CSV = os.path.join(WORK_DIR, INPUT_FILENAME)
 OUTPUT_EXCEL = os.path.join(WORK_DIR, f"{TARGET_SYMBOL}.xlsx")
 
