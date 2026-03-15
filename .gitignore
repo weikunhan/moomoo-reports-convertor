@@ -1,0 +1,9 @@
+#  Python virual environment information
+.vscode
+venv
+__pycache__
+*.pyc
+
+# Project related information
+logs
+data
