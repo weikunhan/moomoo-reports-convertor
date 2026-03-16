@@ -1,5 +1,4 @@
-# moomoo-reports-convertor
-About The Moomoo Reports Convertor
+# Moomoo Reports Convertor
 
 ## Installation
 Download repository
