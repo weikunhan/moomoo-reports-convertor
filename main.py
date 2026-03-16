@@ -20,39 +20,35 @@ OUTPUT_EXCEL = os.path.join(WORK_DIR, f"{TARGET_SYMBOL}.xlsx")
 
 
 def clean_numeric(val: Any) -> float:
+
     if pd.isna(val) or val == "":
         return 0.0
+
     if isinstance(val, (int, float)):
         return float(val)
-    cleaned = re.sub(r"[^\d.-]", "", str(val))
+
+    res = re.sub(r"[^\d.-]", "", str(val))
+
     try:
-        return float(cleaned)
+        return float(res)
     except ValueError:
         return 0.0
 
 
 def parse_filled_avg(val: Any) -> Tuple[float, float]:
+
     if pd.isna(val) or "@" not in str(val):
         return 0.0, 0.0
+
     parts = str(val).split("@")
     qty = clean_numeric(parts[0])
     price = clean_numeric(parts[1])
     return qty, price
 
 
-def process_data() -> Optional[pd.DataFrame]:
-    print(f"当前目标云盘目录: {WORK_DIR}")
+def process_data(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    cols_to_fill = ["代码", "方向", "名称"]
 
-    if not os.path.exists(INPUT_CSV):
-        print(f"\n❌ 找不到文件: {INPUT_CSV}")
-        return None
-
-    try:
-        df = pd.read_csv(INPUT_CSV, encoding="utf-8")
-    except UnicodeDecodeError:
-        df = pd.read_csv(INPUT_CSV, encoding="gbk")
-
-    cols_to_fill = ["代码", "方向", "成交时间"]
     for col in cols_to_fill:
         if col in df.columns:
             df[col] = df[col].replace("", np.nan).ffill()
@@ -119,7 +115,7 @@ def process_data() -> Optional[pd.DataFrame]:
     return final_df
 
 
-def export_to_excel_locally(processed_df: pd.DataFrame) -> None:
+def export_excel(processed_df: pd.DataFrame) -> None:
     if processed_df is None or processed_df.empty:
         return
 
@@ -150,7 +146,24 @@ def export_to_excel_locally(processed_df: pd.DataFrame) -> None:
         print(f"❌ 写入 Excel 文件时发生错误: {e}")
 
 
-if __name__ == "__main__":
-    data = process_data()
+def main():
+
+    print(f"当前目标云盘目录: {WORK_DIR}")
+
+    if not os.path.exists(INPUT_CSV):
+        print(f"\n❌ 找不到文件: {INPUT_CSV}")
+        return
+
+    try:
+        df = pd.read_csv(INPUT_CSV, encoding="utf-8")
+    except UnicodeDecodeError:
+        df = pd.read_csv(INPUT_CSV, encoding="gbk")
+
+    data = process_data(df)
+
     if data is not None:
-        export_to_excel_locally(data)
+        export_excel(data)
+
+
+if __name__ == "__main__":
+    main()
