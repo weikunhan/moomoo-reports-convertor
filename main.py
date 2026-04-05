@@ -18,13 +18,22 @@ WORK_DIR = "/content/drive/MyDrive/Test"
 INPUT_CSV = os.path.join(WORK_DIR, INPUT_FILENAME)
 OUTPUT_EXCEL = os.path.join(WORK_DIR, f"{TARGET_SYMBOL}.xlsx")
 
+# 预编译正则表达式，提升循环内部重复调用时的性能
+_NUMERIC_CLEAN_RE = re.compile(r"[^\d.-]")
+# 预编译期权前缀匹配正则
+_SYMBOL_PREFIX_RE = re.compile(r"^([A-Z]+\d+)[CP]")
+
 
 def clean_numeric(val: Any) -> float:
+
     if pd.isna(val) or val == "":
         return 0.0
+
     if isinstance(val, (int, float)):
         return float(val)
-    res = re.sub(r"[^\d.-]", "", str(val))
+
+    res = _NUMERIC_CLEAN_RE.sub("", str(val))
+
     try:
         return float(res)
     except ValueError:
@@ -86,45 +95,45 @@ def analyze_strategy(symbol: str, name: str, direction: str) -> str:
     return strategy
 
 
-# ================= 数据处理拆分模块 =================
-
-
 def _prepare_dataframe(df: pd.DataFrame, target_symbol: str) -> Optional[pd.DataFrame]:
-    """步骤 1: 填充缺失数据并过滤出目标标的"""
-    cols_to_fill = ["代码", "方向", "名称"]
-    for col in cols_to_fill:
-        if col in df.columns:
-            df[col] = df[col].replace("", np.nan).ffill()
 
-    df_filtered = df[df["代码"].astype(str).str.startswith(target_symbol)].copy()
+    df = df.copy()
+    cols_to_fill = [col for col in ["方向", "代码", "名称"] if col in df.columns]
+
+    if cols_to_fill:
+        df[cols_to_fill] = df[cols_to_fill].replace("", np.nan).ffill()
+
+    df_filtered = df[df["代码"].astype(str).str.startswith(target_symbol)]
 
     if df_filtered.empty:
         print(f"没有找到关于 {target_symbol} 的任何数据。")
         return None
-    return df_filtered
+
+    return df_filtered.reset_index(drop=True)
 
 
-def _extract_raw_trades(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """步骤 2: 逐行提取交易明细，只做原始字符串提取"""
+def _extract_trades(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+
     processed_rows = []
     pending_fee = 0.0
 
-    current_strategy = "未知策略"
+    strategy = "未知策略"
     active_combo_prefix = ""
     active_combo_qty = 0
 
-    for _, row in df.iterrows():
+    # 使用 to_dict('records') 替代 iterrows，速度提升 10x-50x 且完美兼容 row.get()
+    for row in df.to_dict("records"):
         order_qty = str(row.get("订单数量", "")).strip()
         fee = clean_numeric(row.get("合计费用", 0))
         direction = str(row.get("方向", "")).strip()
         symbol = str(row.get("代码", "")).strip()
         name = str(row.get("名称", "")).strip()
 
-        prefix_match = re.match(r"^([A-Z]+\d+)[CP]", symbol)
+        prefix_match = _SYMBOL_PREFIX_RE.match(symbol)
         symbol_prefix = prefix_match.group(1) if prefix_match else symbol
 
         if "组" in order_qty:
-            current_strategy = analyze_strategy(symbol, name, direction)
+            strategy = analyze_strategy(symbol, name, direction)
             active_combo_prefix = symbol_prefix
             active_combo_qty = clean_numeric(order_qty)
             pending_fee += fee
@@ -139,7 +148,7 @@ def _extract_raw_trades(df: pd.DataFrame) -> Optional[pd.DataFrame]:
             ):
                 pass
             else:
-                current_strategy = analyze_strategy(symbol, name, direction)
+                strategy = analyze_strategy(symbol, name, direction)
                 active_combo_prefix = ""
                 active_combo_qty = 0
 
@@ -153,9 +162,9 @@ def _extract_raw_trades(df: pd.DataFrame) -> Optional[pd.DataFrame]:
                     "Raw_Date": str(row.get("成交时间", "")),
                     "Type": direction,
                     "Symbol": symbol,
-                    "Strategy": current_strategy,
+                    "Strategy": strategy,
                     "Quantity": actual_qty,
-                    "Raw_Price": actual_qty * actual_price,
+                    "Raw_Quantity_Price": actual_qty * actual_price,
                     "Raw_Amount": actual_amount,
                     "Fee": -(fee + pending_fee),
                 }
@@ -171,128 +180,110 @@ def _extract_raw_trades(df: pd.DataFrame) -> Optional[pd.DataFrame]:
 
 
 def _aggregate_trades(df: pd.DataFrame) -> pd.DataFrame:
-    """步骤 3: 集中处理时间格式并聚合拆分订单"""
-    # 1. 提取时间并生成辅助年份列
-    df["Date"] = pd.to_datetime(
+
+    clean_dates = pd.to_datetime(
         df["Raw_Date"].str.replace(r"\s*\(.*\)", "", regex=True)
     )
-    df["Year"] = df["Date"].dt.strftime("%Y")
-
-    # 直接原地覆写 Date 列为字符串，彻底抛弃 Date_Str
-    df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
-
-    # 直接将 Date 作为分组主键
-    group_cols = ["Date", "Year", "Type", "Symbol", "Strategy"]
-
-    df_grouped = df.groupby(group_cols, as_index=False).agg(
-        {"Quantity": "sum", "Fee": "sum", "Raw_Price": "sum", "Raw_Amount": "sum"}
+    df = df.assign(
+        Date=clean_dates.dt.strftime("%Y-%m-%d"), Year=clean_dates.dt.year.astype(str)
     )
-
-    df_grouped["Price"] = (df_grouped["Raw_Price"] / df_grouped["Quantity"]).round(4)
-    df_grouped = df_grouped.drop(columns=["Raw_Price"])
-
-    return df_grouped
-
-
-def _calculate_final_metrics(df: pd.DataFrame, target_symbol: str) -> pd.DataFrame:
-    """步骤 4: 赋予资金正负号、计算资产类别并执行严谨的资金验证"""
-    df["Amount"] = np.where(df["Type"] == "买入", -df["Raw_Amount"], df["Raw_Amount"])
-
-    df["Asset_Type"] = np.where(df["Symbol"] == target_symbol, "STOCK", "OPTION")
-    multiplier = np.where(df["Asset_Type"] == "STOCK", 1, 100)
-
-    # 核心验证逻辑
-    theoretical_amount = np.where(
-        df["Type"] == "买入",
-        -df["Quantity"] * df["Price"] * multiplier,
-        df["Quantity"] * df["Price"] * multiplier,
+    cols_to_group = ["Date", "Year", "Type", "Symbol", "Strategy"]
+    df_grouped = df.groupby(cols_to_group, as_index=False).agg(
+        {
+            "Quantity": "sum",
+            "Fee": "sum",
+            "Raw_Quantity_Price": "sum",
+            "Raw_Amount": "sum",
+        }
     )
+    df_grouped["Price"] = (
+        df_grouped["Raw_Quantity_Price"] / df_grouped["Quantity"]
+    ).round(4)
+    return df_grouped.drop(columns=["Raw_Quantity_Price"])
 
-    df["Validation_Diff"] = abs(theoretical_amount - df["Amount"]).round(2)
-    df["Theoretical_Amount"] = theoretical_amount.round(2)
 
-    df = df.drop(columns=["Raw_Amount"])
-    df = df.sort_values(by="Date", ascending=False).reset_index(drop=True)
+def _validate_result(df: pd.DataFrame, target_symbol: str) -> pd.DataFrame:
 
+    asset_type = np.where(df["Symbol"] == target_symbol, "STOCK", "OPTION")
+    multiplier = np.where(asset_type == "STOCK", 1, 100)
+    trade_sign = np.where(df["Type"] == "买入", -1, 1)
+    actual_amount = df["Raw_Amount"] * trade_sign
+    theoretical_amount = df["Quantity"] * df["Price"] * multiplier * trade_sign
+    df = (
+        df.assign(
+            Asset_Type=asset_type,
+            Amount=actual_amount,
+            Theoretical_Amount=theoretical_amount.round(2),
+            Validation_Diff=abs(theoretical_amount - actual_amount).round(2),
+        )
+        .drop(columns=["Raw_Amount"])
+        .sort_values(by="Date", ascending=False)
+        .reset_index(drop=True)
+    )
     return df
 
 
 def process_data(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """主控流水线: 按顺序调度各个数据处理模块"""
-    # 1. 准备数据
-    df = _prepare_dataframe(df, TARGET_SYMBOL)
-    if df is None:
+
+    prepared_df = _prepare_dataframe(df, TARGET_SYMBOL)
+
+    if prepared_df is None:
         return None
 
-    # 2. 提取明细与费用归集
-    raw_trades_df = _extract_raw_trades(df)
-    if raw_trades_df is None:
+    extracted_df = _extract_trades(prepared_df)
+
+    if extracted_df is None:
         return None
 
-    # 3. 分组聚合处理拆分订单
-    aggregated_df = _aggregate_trades(raw_trades_df)
-
-    # 4. 计算验证结果与最终金额
-    final_df = _calculate_final_metrics(aggregated_df, TARGET_SYMBOL)
-
-    return final_df
+    aggregated_df = _aggregate_trades(extracted_df)
+    validated_df = _validate_result(aggregated_df, TARGET_SYMBOL)
+    return validated_df
 
 
-# ===================================================
+def export_excel(df: pd.DataFrame) -> None:
 
-
-def export_excel(processed_df: pd.DataFrame) -> None:
-
-    if processed_df is None or processed_df.empty:
+    if df is None or df.empty:
         return
 
     print(f"正在生成 Excel 文件: {OUTPUT_EXCEL}")
     cols = ["Date", "Type", "Symbol", "Strategy", "Quantity", "Price", "Amount", "Fee"]
-    val_cols = [
-        "Date",
-        "Type",
-        "Symbol",
-        "Quantity",
-        "Price",
-        "Amount",
-        "Theoretical_Amount",
-        "Validation_Diff",
-    ]
-    val_headers = [
-        "Date",
-        "Type",
-        "Symbol",
-        "Quantity",
-        "Avg_Price",
-        "Actual_Amount",
-        "Expected_Amount",
-        "Diff_Warning",
-    ]
+    log_col_map = {
+        "Date": "Date",
+        "Type": "Type",
+        "Symbol": "Symbol",
+        "Quantity": "Quantity",
+        "Price": "Avg_Price",
+        "Amount": "Actual_Amount",
+        "Theoretical_Amount": "Expected_Amount",
+        "Validation_Diff": "Diff_Warning",
+    }
 
     try:
         with pd.ExcelWriter(OUTPUT_EXCEL, engine="openpyxl") as writer:
-            stock_df = processed_df[processed_df["Asset_Type"] == "STOCK"]
+            stock_df = df[df["Asset_Type"] == "STOCK"]
 
             if not stock_df.empty:
-                res = stock_df[cols].copy()
-                res.to_excel(writer, sheet_name="STOCK", index=False)
+                stock_df[cols].to_excel(writer, sheet_name="STOCK", index=False)
                 print(" ✅ 已成功写入 STOCK 表")
 
-            option_df = processed_df[processed_df["Asset_Type"] == "OPTION"]
+            option_df = df[df["Asset_Type"] == "OPTION"]
 
             if not option_df.empty:
                 for year in sorted(option_df["Year"].unique(), reverse=True):
                     sheet_name = f"OPTION_{year}"
-                    res = option_df[option_df["Year"] == year][cols].copy()
-                    res.to_excel(writer, sheet_name=sheet_name, index=False)
+                    option_year_df = option_df[option_df["Year"] == year]
+                    option_year_df[cols].to_excel(
+                        writer, sheet_name=sheet_name, index=False
+                    )
                     print(f" ✅ 已成功写入 {sheet_name} 表")
 
-            validation_df = processed_df[processed_df["Validation_Diff"] > 0.5]
+            validation_df = df[df["Validation_Diff"] > 0.5]
 
             if not validation_df.empty:
-                res = validation_df[val_cols].copy()
-                res.columns = val_headers
-                res.to_excel(writer, sheet_name="LOG", index=False)
+                log_df = validation_df[list(log_col_map.keys())].rename(
+                    columns=log_col_map
+                )
+                log_df.to_excel(writer, sheet_name="VALIDATION", index=False)
                 print(
                     f" ⚠️ 警告：发现 {len(validation_df)} 笔资金对账异常！已生成 'LOG' 标签页。"
                 )
